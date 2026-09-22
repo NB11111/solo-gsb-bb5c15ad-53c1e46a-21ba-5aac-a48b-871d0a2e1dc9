@@ -19,13 +19,17 @@ from .engine import (
     FootprintAnalysisError,
     ImpactAnalysisError,
     RulesetCompileError,
+    compare_results,
     compile_ruleset,
+    decision_diff,
     evaluate,
     impact_analysis,
     input_footprint,
 )
 from .schemas import (
     BatchEvaluationOut,
+    CompareOut,
+    CompareRequest,
     ErrorResponse,
     EvaluateBatchRequest,
     EvaluateRequest,
@@ -496,6 +500,97 @@ def evaluate_batch(
         "success_count": success_count,
         "error_count": error_count,
         "results": results,
+    }
+
+
+@app.post(
+    "/api/rulesets/{ruleset_id}/compare",
+    response_model=CompareOut,
+    tags=["evaluation"],
+    responses={404: {"model": ErrorResponse}},
+)
+def compare_versions(
+    ruleset_id: str,
+    req: CompareRequest,
+    conn: sqlite3.Connection = Depends(get_db),
+) -> Any:
+    """发布前预演：同一份文档分别按两个版本求值（不落库），归并差异。
+
+    规则集或任一版本不存在属于请求级错误，返回 404；两侧求值互相隔离，
+    一侧失败只在该侧 error 中按现有错误结构返回，不影响另一侧，且
+    summary / decision_diff 为 null。
+    """
+    row = crud.get_ruleset(conn, ruleset_id)
+    if row is None:
+        return _error("NOT_FOUND", f"规则集不存在：{ruleset_id}", 404)
+
+    try:
+        _base_snapshot, base_compiled = _load_compiled(
+            conn, ruleset_id, req.base_version
+        )
+    except LookupError:
+        return _error(
+            "VERSION_NOT_FOUND", f"版本 {req.base_version} 不存在", 404
+        )
+    try:
+        _target_snapshot, target_compiled = _load_compiled(
+            conn, ruleset_id, req.target_version
+        )
+    except LookupError:
+        return _error(
+            "VERSION_NOT_FOUND", f"版本 {req.target_version} 不存在", 404
+        )
+
+    def _run_side(version: int, compiled: CompiledRuleset) -> dict[str, Any]:
+        try:
+            result = evaluate(compiled, req.document)
+        except EvaluationFailed as exc:
+            return {
+                "version": version,
+                "status": "error",
+                "result": None,
+                "error": {
+                    "code": exc.code,
+                    "message": exc.message,
+                    "details": exc.details,
+                },
+            }
+        except Exception as exc:  # 单侧失败隔离，不影响另一侧
+            return {
+                "version": version,
+                "status": "error",
+                "result": None,
+                "error": {
+                    "code": "EVALUATION_ERROR",
+                    "message": f"文档求值失败：{exc}",
+                    "details": {},
+                },
+            }
+        # persist=False：只算不存，记录结构与 evaluate?persist=false 同构
+        record = _persist_evaluation(
+            conn, ruleset_id, version, req.document, result, persist=False
+        )
+        return {"version": version, "status": "success", "result": record, "error": None}
+
+    base_side = _run_side(req.base_version, base_compiled)
+    target_side = _run_side(req.target_version, target_compiled)
+
+    summary: dict[str, Any] | None = None
+    diff: dict[str, Any] | None = None
+    if base_side["status"] == "success" and target_side["status"] == "success":
+        base_result = base_side["result"]
+        target_result = target_side["result"]
+        summary = compare_results(base_result, target_result)
+        diff = decision_diff(base_result["decision"], target_result["decision"])
+
+    return {
+        "ruleset_id": ruleset_id,
+        "base_version": req.base_version,
+        "target_version": req.target_version,
+        "base": base_side,
+        "target": target_side,
+        "summary": summary,
+        "decision_diff": diff,
     }
 
 

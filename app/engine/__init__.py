@@ -14,6 +14,7 @@ from .compiler import (
     detect_cycle,
     topo_order,
 )
+from .diff import compare_results, conflict_diff, decision_diff, list_diff
 from .evaluator import EvaluationFailed, evaluate
 from .footprint import FootprintAnalysisError, input_footprint
 from .impact import ImpactAnalysisError, impact_analysis, reverse_dependencies
@@ -31,6 +32,10 @@ __all__ = [
     "topo_order",
     "EvaluationFailed",
     "evaluate",
+    "compare_results",
+    "conflict_diff",
+    "decision_diff",
+    "list_diff",
     "FootprintAnalysisError",
     "input_footprint",
     "ImpactAnalysisError",

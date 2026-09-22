@@ -22,7 +22,8 @@
 │   │   ├── compiler.py    # 规则编译：引用、依赖、循环、冲突策略校验
 │   │   ├── evaluator.py   # 拓扑排序 + 定点迭代 + 冲突处理
 │   │   ├── impact.py      # 静态影响分析：反向依赖闭包 + 冲突组联动
-│   │   └── footprint.py   # 静态输入足迹：doc 访问链 → RFC 6901 JSON Pointer
+│   │   ├── footprint.py   # 静态输入足迹：doc 访问链 → RFC 6901 JSON Pointer
+│   │   └── diff.py        # 跨版本预演：决策 JSON 路径差异 + 命中规则/冲突摘要
 │   └── seed.py            # 演示规则集初始化
 ├── tests/                 # pytest 单元/接口测试
 ├── Dockerfile
@@ -186,6 +187,7 @@ SEED_DEMO=1 uvicorn app.main:app --host 0.0.0.0 --port 8000
 | `PUT`  | `/api/rulesets/{id}` | 修改规则集 → 生成新版本并自动重算 |
 | `POST` | `/api/rulesets/{id}/evaluate` | 用最新版（或 `?version=n` 指定旧版）决策，默认持久化结果 |
 | `POST` | `/api/rulesets/{id}/evaluate-batch` | 批量决策（≤100 项），整批固定同一版本，逐项隔离错误 |
+| `POST` | `/api/rulesets/{id}/compare` | 发布前预演：同一文档按两个版本求值（不落库），返回两版决策与差异摘要 |
 | `GET`  | `/api/rulesets/{id}/evaluations` | 列出该规则集的历史决策结果 |
 | `GET`  | `/api/rulesets/{id}/evaluation-stats` | 聚合已持久化决策：规则命中率与决策字段统计（支持 `version` / `since` / `until` 筛选） |
 | `GET`  | `/api/evaluations/{eval_id}` | 按 ID 查询单次决策结果 |
@@ -296,6 +298,117 @@ curl -s -X POST localhost:8000/api/rulesets/demo-promotions/evaluate-batch \
 > 注意：批量接口在存在失败项时仍返回 **HTTP 200**，通过每项的
 > `status` / `error` 与顶层计数区分成败；仅当规则集或版本不存在等
 > 整批级问题发生时才返回 4xx。
+
+### 发布前跨版本预演
+
+`POST /api/rulesets/{id}/compare` 在**发布新版本前**用同一份文档分别按
+两个不可变版本快照求值，对比决策差异：
+
+- 请求体指定 `base_version`（基准版）、`target_version`（待发布版）与
+  `document`（缺省为 `{}`）；`base_version` 与 `target_version` 均必填且 ≥ 1；
+- 两版**各自独立求值，不写入 evaluations**（两侧记录的 `id` 均为空，
+  与 `evaluate?persist=false` 同构）；
+- 响应的 `base` / `target` 各自带 `version`、`status`、完整 `result` 与
+  `error`；**任一侧求值失败只体现在该侧 `error`（结构与批量接口的单项
+  错误一致），另一侧照常求值**，HTTP 状态码仍为 200，此时 `summary` 与
+  `decision_diff` 均为 `null`；
+- 两侧均成功时，`summary` 给出命中规则与冲突的跨版本摘要，
+  `decision_diff` 给出按 **JSON Pointer 路径**归并的决策差异。
+
+`summary` 字段：
+
+- `fired_rules` / `hit_rules`：分别比较“求值为真的规则（含被冲突策略
+  压制者）”与“冲突处理后最终生效的规则”。每项含 `base`、`target`
+  （保序回显）以及相对基准版的 `added` / `removed`；
+- `conflicts`：`base` / `target` 回显两侧全部冲突解释；整组冲突按
+  `group`、`collect_all` 的字段覆盖（`group` 为 null）按 `field` 归并，
+  分别给出 `added` / `removed` / `changed`（同组但 `policy`、胜出方或被
+  压制规则集合变化记为 `changed`，条目形如 `{group, field, old, new}`）。
+
+`decision_diff` 的路径归并规则：
+
+- 双方同路径且同为对象或同为数组时递归比较：对象按键、数组按下标对齐；
+- 只在一侧出现的子树**逐叶展开**（新增子树挂在 `added`、消失子树挂在
+  `removed`，每条带 `old`/`new`，缺席一侧为 `null`）；空对象/空数组占
+  自身路径；
+- 同路径类型不同（对象与数组、布尔与数值等）或标量值不同记为 `changed`
+  （注意 JSON 语义下 `true` 与 `1` 视为不同值）；
+- 路径按 **RFC 6901** 转义（`~` → `~0`、`/` → `~1`），三类列表均按路径
+  字典序排列；两版决策完全相同时三个列表均为空。
+
+错误情况：规则集不存在 → **404** `NOT_FOUND`；`base_version` 或
+`target_version` 不存在 → **404** `VERSION_NOT_FOUND`；请求体缺字段、
+版本号 < 1 → **422**。两侧文档求值失败属于**单侧错误**，返回 200 并在
+对应侧的 `error` 中给出（`NOT_CONVERGED` 等现有错误码）。
+
+请求示例（v1 阈值 10、含 r2；v2 阈值收紧到 1000、新增 r3）：
+
+```bash
+curl -s -X POST localhost:8000/api/rulesets/my-set/compare \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "base_version": 1,
+    "target_version": 2,
+    "document": {"x": 42}
+  }' | python3 -m json.tool
+```
+
+响应示例（有省略）：
+
+```json
+{
+  "ruleset_id": "my-set",
+  "base_version": 1,
+  "target_version": 2,
+  "base": {
+    "version": 1,
+    "status": "success",
+    "result": {"id": "", "version": 1, "decision": {"level": "high", "bonus": 1},
+               "fired_rule_codes": ["r1", "r2"], "conflicts": []},
+    "error": null
+  },
+  "target": {
+    "version": 2,
+    "status": "success",
+    "result": {"id": "", "version": 2, "decision": {"extra": {"n": 7}},
+               "fired_rule_codes": ["r3"], "conflicts": []},
+    "error": null
+  },
+  "summary": {
+    "fired_rules": {"base": ["r1", "r2"], "target": ["r3"],
+                    "added": ["r3"], "removed": ["r1", "r2"]},
+    "hit_rules": {"base": ["r1", "r2"], "target": ["r3"],
+                  "added": ["r3"], "removed": ["r1", "r2"]},
+    "conflicts": {"base": [], "target": [],
+                  "added": [], "removed": [], "changed": []}
+  },
+  "decision_diff": {
+    "added": [{"path": "/extra/n", "old": null, "new": 7}],
+    "removed": [
+      {"path": "/bonus", "old": 1, "new": null},
+      {"path": "/level", "old": "high", "new": null}
+    ],
+    "changed": []
+  }
+}
+```
+
+一侧求值失败时的响应示例：
+
+```json
+{
+  "base_version": 1,
+  "target_version": 2,
+  "base": {"version": 1, "status": "success",
+           "result": {"decision": {"ok": 1}}, "error": null},
+  "target": {"version": 2, "status": "error", "result": null,
+             "error": {"code": "NOT_CONVERGED",
+                       "message": "规则评估在 100 轮内未达到稳定状态",
+                       "details": {"max_iterations": 100}}},
+  "summary": null,
+  "decision_diff": null
+}
+```
 
 ### 评估统计
 
@@ -530,5 +643,6 @@ pytest -q
 测试覆盖：AST 沙箱安全性、编译校验（重复编码/未知依赖/隐式引用/循环/冲突策略冲突）、
 拓扑排序、定点迭代、三种冲突策略、版本化重算、评估统计聚合（筛选/排序/零值/非法参数）、
 静态影响分析（反向闭包/层级/多输入去重/冲突组联动/404 与 422）、
-静态输入足迹（doc 访问链提取/RFC 6901 转义/上游闭包 used_by/动态下标 422/404 与 422），
+静态输入足迹（doc 访问链提取/RFC 6901 转义/上游闭包 used_by/动态下标 422/404 与 422）、
+跨版本预演（JSON 路径差异归并/空差异/冲突胜出方变化/求值失败单侧隔离/不落库/404 与 422），
 以及完整 HTTP 接口。

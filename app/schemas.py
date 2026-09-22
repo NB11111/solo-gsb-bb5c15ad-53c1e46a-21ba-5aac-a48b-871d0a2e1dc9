@@ -145,6 +145,80 @@ class RecomputeRequest(BaseModel):
     )
 
 
+class CompareRequest(BaseModel):
+    base_version: int = Field(
+        ..., ge=1, description="作为比较基准的规则版本（必填，不可变快照）"
+    )
+    target_version: int = Field(
+        ..., ge=1, description="待发布预演的目标规则版本（必填，不可变快照）"
+    )
+    document: Any = Field(default_factory=dict)
+
+
+class DiffEntryOut(BaseModel):
+    path: str = Field(..., description="RFC 6901 JSON Pointer；根差异为 \"\"")
+    old: Any | None = Field(None, description="基准版侧的值；added 时为 null")
+    new: Any | None = Field(None, description="目标版侧的值；removed 时为 null")
+
+
+class DecisionDiffOut(BaseModel):
+    added: list[DiffEntryOut] = Field(..., description="仅目标版存在的叶子，按路径排序")
+    removed: list[DiffEntryOut] = Field(..., description="仅基准版存在的叶子，按路径排序")
+    changed: list[DiffEntryOut] = Field(..., description="同路径值/类型变化，按路径排序")
+
+
+class RuleListDiffOut(BaseModel):
+    base: list[str] = Field(..., description="基准版的编码列表（保序回显）")
+    target: list[str] = Field(..., description="目标版的编码列表（保序回显）")
+    added: list[str] = Field(..., description="相对基准版新增的编码")
+    removed: list[str] = Field(..., description="相对基准版消失的编码")
+
+
+class ConflictDiffOut(BaseModel):
+    base: list[dict[str, Any]] = Field(..., description="基准版全部冲突解释")
+    target: list[dict[str, Any]] = Field(..., description="目标版全部冲突解释")
+    added: list[dict[str, Any]] = Field(
+        ..., description="目标版新增的冲突组/字段覆盖，按组名/字段名排序"
+    )
+    removed: list[dict[str, Any]] = Field(
+        ..., description="目标版消失的冲突组/字段覆盖，按组名/字段名排序"
+    )
+    changed: list[dict[str, Any]] = Field(
+        ..., description="同组/同字段但胜出方或被压制方变化的冲突"
+    )
+
+
+class CompareSummaryOut(BaseModel):
+    fired_rules: RuleListDiffOut = Field(..., description="命中评估为真的规则（含被压制者）")
+    hit_rules: RuleListDiffOut = Field(..., description="冲突处理后最终生效的规则")
+    conflicts: ConflictDiffOut = Field(..., description="冲突组与字段覆盖的跨版本摘要")
+
+
+class CompareSide(BaseModel):
+    version: int = Field(..., description="该侧实际求值使用的规则版本")
+    status: Literal["success", "error"]
+    result: EvaluationOut | None = Field(
+        None, description="求值成功时的完整决策结果（不落库，id 为空）"
+    )
+    error: ErrorResponse | None = Field(
+        None, description="该侧求值失败时的错误信息；不影响另一侧"
+    )
+
+
+class CompareOut(BaseModel):
+    ruleset_id: str
+    base_version: int
+    target_version: int
+    base: CompareSide = Field(..., description="基准版一侧的求值结果")
+    target: CompareSide = Field(..., description="目标版一侧的求值结果")
+    summary: CompareSummaryOut | None = Field(
+        None, description="命中规则/冲突摘要；任一侧求值失败时为 null"
+    )
+    decision_diff: DecisionDiffOut | None = Field(
+        None, description="按 JSON 路径归并的决策差异；任一侧求值失败时为 null"
+    )
+
+
 class ImpactRequest(BaseModel):
     version: int = Field(
         ..., ge=1, description="分析所基于的规则版本（必填，不可变快照）"
