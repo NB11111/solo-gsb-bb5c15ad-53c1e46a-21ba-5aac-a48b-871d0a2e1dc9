@@ -22,7 +22,8 @@
 │   │   ├── compiler.py    # 规则编译：引用、依赖、循环、冲突策略校验
 │   │   ├── evaluator.py   # 拓扑排序 + 定点迭代 + 冲突处理
 │   │   ├── impact.py      # 静态影响分析：反向依赖闭包 + 冲突组联动
-│   │   └── footprint.py   # 静态输入足迹：doc 访问链 → RFC 6901 JSON Pointer
+│   │   ├── footprint.py   # 静态输入足迹：doc 访问链 → RFC 6901 JSON Pointer
+│   │   └── compare.py     # 跨版本对比：决策按 JSON 路径归并 added/removed/changed
 │   └── seed.py            # 演示规则集初始化
 ├── tests/                 # pytest 单元/接口测试
 ├── Dockerfile
@@ -183,6 +184,7 @@ SEED_DEMO=1 uvicorn app.main:app --host 0.0.0.0 --port 8000
 | `GET`  | `/api/rulesets/{id}/versions/{version}` | 获取指定版本快照 |
 | `POST` | `/api/rulesets/{id}/impact` | 静态依赖影响分析（不求值、不落库） |
 | `POST` | `/api/rulesets/{id}/input-footprint` | 静态输入足迹：汇总规则及上游读取的文档路径（不求值、不落库） |
+| `POST` | `/api/rulesets/{id}/compare` | 跨版本对比预演：同一文档按两版规则求值并归并差异（不落库） |
 | `PUT`  | `/api/rulesets/{id}` | 修改规则集 → 生成新版本并自动重算 |
 | `POST` | `/api/rulesets/{id}/evaluate` | 用最新版（或 `?version=n` 指定旧版）决策，默认持久化结果 |
 | `POST` | `/api/rulesets/{id}/evaluate-batch` | 批量决策（≤100 项），整批固定同一版本，逐项隔离错误 |
@@ -520,6 +522,84 @@ curl -i -X POST localhost:8000/api/rulesets/r/input-footprint \
 #               "index": "\"k\" + \"x\"", "expression": "doc[\"k\" + \"x\"] == 1"}}}
 ```
 
+### 跨版本对比预演
+
+`POST /api/rulesets/{id}/compare` 用于**发布前预演**：同一份文档分别按
+`base_version` 与 `target_version` 两版规则各求值一次，对比两版结果——
+**两个版本都不会写入 evaluations**（与 `persist=false` 的试算一样不计入
+评估统计）。
+
+请求体：
+
+| 字段 | 说明 |
+| --- | --- |
+| `base_version` | **必填**，基准规则版本（不可变快照） |
+| `target_version` | **必填**，目标规则版本（不可变快照） |
+| `document` | 用于两版预演的文档（任意 JSON，缺省为 `{}`） |
+
+响应字段：
+
+- `base` / `target`：两版各自的决策摘要——`decision`、`fired_rule_codes`
+  （冲突处理前命中）、`hit_rule_codes`（冲突处理后生效）、`conflicts`
+  （冲突解释）、`iterations` 与 `converged`；
+- `hit_rule_diff`：生效规则集合差异。`added` 为仅 target 版生效的规则
+  （按 target 的 evaluation_order 排列），`removed` 为仅 base 版生效的
+  规则（按 base 的 evaluation_order 排列）；
+- `decision_diff`：两份 `decision` 按 **JSON 路径（RFC 6901，与
+  input-footprint 一致）** 递归归并的差异，每类按路径字典序排列：
+  - `added` / `removed`：仅一侧存在的键，以其所在路径为根、子树整体记入
+    （`{"path", "value"}`）；
+  - `changed`：两侧均存在但值不同的叶子路径（`{"path", "base", "target"}`）；
+    列表不做元素级对齐，整体作为原子值比较；
+  - 两版决策一致时三类差异均为空数组。
+
+错误情况：
+
+- 规则集不存在 → **404** `NOT_FOUND`；
+- 任一版本不存在 → **404** `VERSION_NOT_FOUND`；
+- 文档求值失败（如不收敛）→ **422**，沿用 `evaluate` 的错误结构，且两版
+  求值都不会产生任何持久化记录；
+- 请求体缺字段、`base_version` / `target_version` < 1 → **422**。
+
+请求示例（v1 → v2 提高了折扣并新增包邮规则）：
+
+```bash
+curl -s -X POST localhost:8000/api/rulesets/demo-promotions/compare \
+  -H 'Content-Type: application/json' \
+  -d '{"base_version": 1, "target_version": 2,
+       "document": {"amount": 1500, "customer": {"vip": true}, "region": "north"}}' \
+  | python3 -m json.tool
+```
+
+响应示例（摘要字段有省略）：
+
+```json
+{
+  "ruleset_id": "demo-promotions",
+  "base_version": 1,
+  "target_version": 2,
+  "document": {"amount": 1500, "customer": {"vip": true}, "region": "north"},
+  "base": {
+    "decision": {"discount": 0.15, "free_shipping": true},
+    "hit_rule_codes": ["vip_discount", "free_shipping"],
+    "conflicts": [{"group": "discount", "policy": "priority", "winner": "vip_discount"}],
+    "converged": true
+  },
+  "target": {
+    "decision": {"discount": 0.2, "free_shipping": true, "gift": "coupon"},
+    "hit_rule_codes": ["vip_discount", "free_shipping", "gift_rule"],
+    "conflicts": [{"group": "discount", "policy": "priority", "winner": "vip_discount"}],
+    "converged": true
+  },
+  "hit_rule_diff": {"added": ["gift_rule"], "removed": []},
+  "decision_diff": {
+    "added": [{"path": "/gift", "value": "coupon"}],
+    "removed": [],
+    "changed": [{"path": "/discount", "base": 0.15, "target": 0.2}]
+  }
+}
+```
+
 ## 测试
 
 ```bash
@@ -530,5 +610,6 @@ pytest -q
 测试覆盖：AST 沙箱安全性、编译校验（重复编码/未知依赖/隐式引用/循环/冲突策略冲突）、
 拓扑排序、定点迭代、三种冲突策略、版本化重算、评估统计聚合（筛选/排序/零值/非法参数）、
 静态影响分析（反向闭包/层级/多输入去重/冲突组联动/404 与 422）、
-静态输入足迹（doc 访问链提取/RFC 6901 转义/上游闭包 used_by/动态下标 422/404 与 422），
+静态输入足迹（doc 访问链提取/RFC 6901 转义/上游闭包 used_by/动态下标 422/404 与 422）、
+跨版本对比预演（跨版本差异/嵌套路径归并/空差异/求值失败隔离/不落库/404 与 422），
 以及完整 HTTP 接口。

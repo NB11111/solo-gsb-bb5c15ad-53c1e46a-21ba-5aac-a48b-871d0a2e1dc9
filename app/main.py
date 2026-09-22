@@ -19,6 +19,7 @@ from .engine import (
     FootprintAnalysisError,
     ImpactAnalysisError,
     RulesetCompileError,
+    compare_evaluations,
     compile_ruleset,
     evaluate,
     impact_analysis,
@@ -26,6 +27,8 @@ from .engine import (
 )
 from .schemas import (
     BatchEvaluationOut,
+    CompareOut,
+    CompareRequest,
     ErrorResponse,
     EvaluateBatchRequest,
     EvaluateRequest,
@@ -496,6 +499,64 @@ def evaluate_batch(
         "success_count": success_count,
         "error_count": error_count,
         "results": results,
+    }
+
+
+# ---------- 跨版本对比预演 ----------
+
+
+def _compare_side(result: dict[str, Any]) -> dict[str, Any]:
+    """从 evaluate() 结果中摘取对比所需的决策与命中/冲突摘要。"""
+    return {
+        "decision": result["decision"],
+        "fired_rule_codes": result["fired_rule_codes"],
+        "hit_rule_codes": result["hit_rule_codes"],
+        "conflicts": result["conflicts"],
+        "iterations": result["iterations"],
+        "converged": result["converged"],
+    }
+
+
+@app.post(
+    "/api/rulesets/{ruleset_id}/compare",
+    response_model=CompareOut,
+    tags=["evaluation"],
+    responses={404: {"model": ErrorResponse}, 422: {"model": ErrorResponse}},
+)
+def compare_versions(
+    ruleset_id: str,
+    req: CompareRequest,
+    conn: sqlite3.Connection = Depends(get_db),
+) -> Any:
+    """发布前预演：同一文档分别按 base/target 两版规则求值并对比，不写库。
+
+    两个版本各自独立求值（互不写入 evaluations），返回两版决策、命中规则
+    与冲突摘要，以及按 JSON 路径（RFC 6901）归并的 added/removed/changed
+    决策差异与生效规则差异。规则集或任一版本不存在返回 404；文档求值失败
+    沿用 evaluate 的 422 错误结构，且两版求值都不会产生任何持久化记录。
+    """
+    if crud.get_ruleset(conn, ruleset_id) is None:
+        return _error("NOT_FOUND", f"规则集不存在：{ruleset_id}", 404)
+    try:
+        _snapshot, base_compiled = _load_compiled(conn, ruleset_id, req.base_version)
+    except LookupError:
+        return _error("VERSION_NOT_FOUND", f"版本 {req.base_version} 不存在", 404)
+    try:
+        _snapshot, target_compiled = _load_compiled(conn, ruleset_id, req.target_version)
+    except LookupError:
+        return _error("VERSION_NOT_FOUND", f"版本 {req.target_version} 不存在", 404)
+
+    base_result = evaluate(base_compiled, req.document)
+    target_result = evaluate(target_compiled, req.document)
+
+    return {
+        "ruleset_id": ruleset_id,
+        "base_version": req.base_version,
+        "target_version": req.target_version,
+        "document": req.document,
+        "base": _compare_side(base_result),
+        "target": _compare_side(target_result),
+        **compare_evaluations(base_result, target_result),
     }
 
 

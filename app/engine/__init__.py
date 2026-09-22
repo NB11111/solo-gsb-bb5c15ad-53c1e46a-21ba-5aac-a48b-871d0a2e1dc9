@@ -6,6 +6,7 @@ from .ast_eval import (
     RuleRef,
     safe_eval,
 )
+from .compare import compare_evaluations, decision_diff
 from .compiler import (
     CompiledRule,
     CompiledRuleset,
@@ -23,6 +24,8 @@ __all__ = [
     "EvaluationError",
     "RuleRef",
     "safe_eval",
+    "compare_evaluations",
+    "decision_diff",
     "CompiledRule",
     "CompiledRuleset",
     "RulesetCompileError",

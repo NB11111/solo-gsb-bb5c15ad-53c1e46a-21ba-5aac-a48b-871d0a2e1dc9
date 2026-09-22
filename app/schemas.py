@@ -145,6 +145,79 @@ class RecomputeRequest(BaseModel):
     )
 
 
+class CompareRequest(BaseModel):
+    base_version: int = Field(
+        ..., ge=1, description="基准规则版本（必填，不可变快照）"
+    )
+    target_version: int = Field(
+        ..., ge=1, description="目标规则版本（必填，不可变快照）"
+    )
+    document: Any = Field(
+        default_factory=dict, description="用于两版预演的文档（任意 JSON）"
+    )
+
+
+class CompareSideOut(BaseModel):
+    decision: dict[str, Any] = Field(..., description="该版本下的最终决策结果")
+    fired_rule_codes: list[str] = Field(
+        ..., description="该版本下命中的规则（冲突处理前），按 evaluation_order 排列"
+    )
+    hit_rule_codes: list[str] = Field(
+        ..., description="冲突处理后实际生效的规则，按 evaluation_order 排列"
+    )
+    conflicts: list[dict[str, Any]] = Field(..., description="该版本下的冲突解释")
+    iterations: int = Field(..., description="定点迭代轮数")
+    converged: bool = Field(..., description="是否达到稳定结果")
+
+
+class HitRuleDiffOut(BaseModel):
+    added: list[str] = Field(
+        ..., description="仅 target 版本生效的规则编码，按 target 的 evaluation_order 排列"
+    )
+    removed: list[str] = Field(
+        ..., description="仅 base 版本生效的规则编码，按 base 的 evaluation_order 排列"
+    )
+
+
+class DecisionDiffAddedOut(BaseModel):
+    path: str = Field(..., description="RFC 6901 JSON Pointer")
+    value: Any = Field(..., description="target 决策在该路径的值（子树整体）")
+
+
+class DecisionDiffRemovedOut(BaseModel):
+    path: str = Field(..., description="RFC 6901 JSON Pointer")
+    value: Any = Field(..., description="base 决策在该路径的值（子树整体）")
+
+
+class DecisionDiffChangedOut(BaseModel):
+    path: str = Field(..., description="RFC 6901 JSON Pointer")
+    base: Any = Field(..., description="base 决策在该路径的值")
+    target: Any = Field(..., description="target 决策在该路径的值")
+
+
+class DecisionDiffOut(BaseModel):
+    added: list[DecisionDiffAddedOut] = Field(
+        ..., description="仅 target 决策存在的路径，按路径字典序排列"
+    )
+    removed: list[DecisionDiffRemovedOut] = Field(
+        ..., description="仅 base 决策存在的路径，按路径字典序排列"
+    )
+    changed: list[DecisionDiffChangedOut] = Field(
+        ..., description="两侧均存在但值不同的路径，按路径字典序排列"
+    )
+
+
+class CompareOut(BaseModel):
+    ruleset_id: str
+    base_version: int = Field(..., description="实际使用的基准版本")
+    target_version: int = Field(..., description="实际使用的目标版本")
+    document: Any = Field(..., description="回显本次预演的文档")
+    base: CompareSideOut = Field(..., description="基准版本下的决策与命中/冲突摘要")
+    target: CompareSideOut = Field(..., description="目标版本下的决策与命中/冲突摘要")
+    hit_rule_diff: HitRuleDiffOut
+    decision_diff: DecisionDiffOut
+
+
 class ImpactRequest(BaseModel):
     version: int = Field(
         ..., ge=1, description="分析所基于的规则版本（必填，不可变快照）"
